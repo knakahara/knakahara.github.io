@@ -1,0 +1,57 @@
+diff --git a/sys/dev/pci/ahcisata_pci.c b/sys/dev/pci/ahcisata_pci.c
+index a8b0c7f..f336883 100644
+--- a/sys/dev/pci/ahcisata_pci.c
++++ b/sys/dev/pci/ahcisata_pci.c
+@@ -292,7 +292,8 @@ ahci_pci_attach(device_t parent, device_t self, void *aux)
+ 	}
+ 	intrstr = pci_intr_string(pa->pa_pc, intrhandle,
+ 	    intrbuf, sizeof(intrbuf));
+-	psc->sc_ih = pci_intr_establish(pa->pa_pc, intrhandle, IPL_BIO, ahci_intr, sc);
++	psc->sc_ih = pci_intr_establish_xname(pa->pa_pc, intrhandle, IPL_BIO, ahci_intr, sc,
++	    device_xname(self));
+ 	if (psc->sc_ih == NULL) {
+ 		aprint_error_dev(self, "couldn't establish interrupt\n");
+ 		return;
+diff --git a/sys/dev/pci/ehci_pci.c b/sys/dev/pci/ehci_pci.c
+index 5bd3281..7044232 100644
+--- a/sys/dev/pci/ehci_pci.c
++++ b/sys/dev/pci/ehci_pci.c
+@@ -178,7 +178,8 @@ ehci_pci_attach(device_t parent, device_t self, void *aux)
+ 	 * Allocate IRQ
+ 	 */
+ 	intrstr = pci_intr_string(pc, ih, intrbuf, sizeof(intrbuf));
+-	sc->sc_ih = pci_intr_establish(pc, ih, IPL_SCHED, ehci_intr, sc);
++	sc->sc_ih = pci_intr_establish_xname(pc, ih, IPL_SCHED, ehci_intr, sc,
++	    device_xname(self));
+ 	if (sc->sc_ih == NULL) {
+ 		aprint_error_dev(self, "couldn't establish interrupt");
+ 		if (intrstr != NULL)
+diff --git a/sys/dev/pci/ichsmb.c b/sys/dev/pci/ichsmb.c
+index a29aea6..e1eb10e 100644
+--- a/sys/dev/pci/ichsmb.c
++++ b/sys/dev/pci/ichsmb.c
+@@ -165,8 +165,8 @@ ichsmb_attach(device_t parent, device_t self, void *aux)
+ 		/* Install interrupt handler */
+ 		if (pci_intr_map(pa, &ih) == 0) {
+ 			intrstr = pci_intr_string(pa->pa_pc, ih, intrbuf, sizeof(intrbuf));
+-			sc->sc_ih = pci_intr_establish(pa->pa_pc, ih, IPL_BIO,
+-			    ichsmb_intr, sc);
++			sc->sc_ih = pci_intr_establish_xname(pa->pa_pc, ih, IPL_BIO,
++			    ichsmb_intr, sc, device_xname(self));
+ 			if (sc->sc_ih != NULL) {
+ 				aprint_normal_dev(self, "interrupting at %s\n",
+ 				    intrstr);
+diff --git a/sys/dev/pci/if_wm.c b/sys/dev/pci/if_wm.c
+index 12bf45d..5591b16 100644
+--- a/sys/dev/pci/if_wm.c
++++ b/sys/dev/pci/if_wm.c
+@@ -1417,7 +1417,8 @@ wm_attach(device_t parent, device_t self, void *aux)
+ #ifdef WM_MPSAFE
+ 	pci_intr_setattr(pc, &ih, PCI_INTR_MPSAFE, true);
+ #endif
+-	sc->sc_ih = pci_intr_establish(pc, ih, IPL_NET, wm_intr, sc);
++	sc->sc_ih = pci_intr_establish_xname(pc, ih, IPL_NET, wm_intr, sc,
++	    device_xname(sc->sc_dev));
+ 	if (sc->sc_ih == NULL) {
+ 		aprint_error_dev(sc->sc_dev, "unable to establish interrupt");
+ 		if (intrstr != NULL)
