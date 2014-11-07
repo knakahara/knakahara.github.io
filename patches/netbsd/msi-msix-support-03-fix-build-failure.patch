@@ -1,0 +1,28 @@
+commit 4c7e21b20ff75639015333e158229e0183534c22
+Author: Kengo NAKAHARA <k-nakahara@iij.ad.jp>
+Date:   Fri Nov 7 04:38:08 2014 +0000
+
+    fix build failure
+
+diff --git a/sys/external/bsd/drm2/pci/drm_pci.c b/sys/external/bsd/drm2/pci/drm_pci.c
+index 9006a43..106b73b 100644
+--- a/sys/external/bsd/drm2/pci/drm_pci.c
++++ b/sys/external/bsd/drm2/pci/drm_pci.c
+@@ -217,7 +217,7 @@ static int
+ drm_pci_get_irq(struct drm_device *dev)
+ {
+ 	pci_intr_handle_t ih_pih;
+-	int ih_int;
++	pci_intr_handle_t ih_int;
+ 
+ 	/*
+ 	 * This is a compile-time assertion that the types match.  If
+@@ -230,7 +230,7 @@ drm_pci_get_irq(struct drm_device *dev)
+ 		return -1;	/* XXX Hope -1 is an invalid intr handle.  */
+ 
+ 	ih_int = ih_pih;
+-	return ih_int;
++	return (int)ih_int;
+ }
+ 
+ static int
