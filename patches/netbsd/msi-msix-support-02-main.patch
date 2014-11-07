@@ -1,0 +1,2157 @@
+diff --git a/sys/arch/amd64/amd64/autoconf.c b/sys/arch/amd64/amd64/autoconf.c
+index f5a0c1f..4662eff 100644
+--- a/sys/arch/amd64/amd64/autoconf.c
++++ b/sys/arch/amd64/amd64/autoconf.c
+@@ -80,6 +80,8 @@ extern void platform_init(void);
+ 
+ #include <x86/x86/tsc.h>
+ 
++#include <x86/pci/msipic.h>
++
+ /*
+  * Determine i/o configuration for a machine.
+  */
+@@ -96,6 +98,8 @@ cpu_configure(void)
+ 
+ 	x86_64_proc0_tss_ldt_init();
+ 
++	msipic_init();
++
+ 	if (config_rootfound("mainbus", NULL) == NULL)
+ 		panic("configure: mainbus not configured");
+ 
+diff --git a/sys/arch/i386/i386/autoconf.c b/sys/arch/i386/i386/autoconf.c
+index 90a5d16..cd104ac 100644
+--- a/sys/arch/i386/i386/autoconf.c
++++ b/sys/arch/i386/i386/autoconf.c
+@@ -91,6 +91,8 @@ extern void platform_init(void);
+ #include <i386/pci/pcibios.h>
+ #endif
+ 
++#include <x86/pci/msipic.h>
++
+ /*
+  * Determine i/o configuration for a machine.
+  */
+@@ -109,6 +111,8 @@ cpu_configure(void)
+ 	pcibios_init();
+ #endif
+ 
++	msipic_init();
++
+ 	if (config_rootfound("mainbus", NULL) == NULL)
+ 		panic("configure: mainbus not configured");
+ 
+diff --git a/sys/arch/x86/conf/files.x86 b/sys/arch/x86/conf/files.x86
+index 2a4f0a8..078dc5e 100644
+--- a/sys/arch/x86/conf/files.x86
++++ b/sys/arch/x86/conf/files.x86
+@@ -141,6 +141,8 @@ file	arch/x86/x86/tprof_amdpmi.c	tprof_amdpmi
+ file	arch/x86/pci/pci_machdep.c	pci
+ #file	arch/x86/pci/pci_ranges.c	pci
+ file	arch/x86/pci/pci_intr_machdep.c	pci
++file	arch/x86/pci/pci_msi_machdep.c	pci
++file	arch/x86/pci/msipic.c		pci
+ 
+ file	arch/x86/pci/pciide_machdep.c	pciide_common
+ 
+diff --git a/sys/arch/x86/include/i82093var.h b/sys/arch/x86/include/i82093var.h
+index a3ae23b..b84b9b5 100644
+--- a/sys/arch/x86/include/i82093var.h
++++ b/sys/arch/x86/include/i82093var.h
+@@ -68,19 +68,35 @@ struct ioapic_softc {
+  * (ih&0xff0000)>>16 -> ioapic id.
+  * (ih&0x00ff00)>>8 -> ioapic pin.
+  *
+- * 0x80000000 is used by pci_intr_machdep.c for MPSAFE_MASK
++ * (ih&0x000ff80000000000)>>43 -> MSI/MSI-X device id.
++ * (ih&0x000007ff00000000)>>32 -> MSI/MSI-X vector id in a device.
+  */
++#define	MPSAFE_MASK		0x80000000
+ 
+ #define APIC_INT_VIA_APIC	0x10000000
++#define APIC_INT_VIA_MSI	0x20000000
+ #define APIC_INT_APIC_MASK	0x00ff0000
+ #define APIC_INT_APIC_SHIFT	16
+ #define APIC_INT_PIN_MASK	0x0000ff00
+ #define APIC_INT_PIN_SHIFT	8
+ 
+-#define APIC_IRQ_APIC(x) ((x & APIC_INT_APIC_MASK) >> APIC_INT_APIC_SHIFT)
+-#define APIC_IRQ_PIN(x) ((x & APIC_INT_PIN_MASK) >> APIC_INT_PIN_SHIFT)
+-#define APIC_IRQ_ISLEGACY(x) (!((x) & APIC_INT_VIA_APIC))
+-#define APIC_IRQ_LEGACY_IRQ(x) ((x) & 0xff)
++#define APIC_IRQ_APIC(x) (((int)(x) & APIC_INT_APIC_MASK) >> APIC_INT_APIC_SHIFT)
++#define APIC_IRQ_PIN(x) (((int)(x) & APIC_INT_PIN_MASK) >> APIC_INT_PIN_SHIFT)
++#define APIC_IRQ_ISLEGACY(x) (!((int)(x) & APIC_INT_VIA_APIC))
++#define APIC_IRQ_LEGACY_IRQ(x) ((int)(x) & 0xff)
++
++#define INT_VIA_MSI(x) (((int)(x) & APIC_INT_VIA_MSI) != 0)
++
++#define MSI_INT_MSIX		0x1000000000000000UL
++#define MSI_INT_DEV_MASK	0x000ff80000000000UL
++#define MSI_INT_VEC_MASK	0x000007ff00000000UL
++#define MSI_INT_MSIX_INVALID	0x0000000000000000UL
++
++#define MSI_INT_IS_MSIX(x) ((bool)(((x) & MSI_INT_MSIX) != 0))
++#define MSI_INT_MAKE_MSI(x) ((x) &= ~MSI_INT_MSIX)
++#define MSI_INT_MAKE_MSIX(x) ((x) |= MSI_INT_MSIX)
++#define MSI_INT_DEV(x) __SHIFTOUT((x), MSI_INT_DEV_MASK)
++#define MSI_INT_VEC(x) __SHIFTOUT((x), MSI_INT_VEC_MASK)
+ 
+ void ioapic_print_redir(struct ioapic_softc *, const char *, int);
+ void ioapic_format_redir(char *, const char *, int, uint32_t, uint32_t);
+diff --git a/sys/arch/x86/include/intrdefs.h b/sys/arch/x86/include/intrdefs.h
+index 17245df..347d403 100644
+--- a/sys/arch/x86/include/intrdefs.h
++++ b/sys/arch/x86/include/intrdefs.h
+@@ -56,7 +56,7 @@
+ #define IDT_INTR_LOW	(0x20 + NUM_LEGACY_IRQS)
+ #define IDT_INTR_HIGH	0xef
+ 
+-#define NUM_IO_INTS	255
++#define MAX_MSIX_COUNT 2048
+ 
+ #ifndef XEN
+ 
+diff --git a/sys/arch/x86/include/pci_machdep.h b/sys/arch/x86/include/pci_machdep.h
+index c09d20a..5b8eac4 100644
+--- a/sys/arch/x86/include/pci_machdep.h
++++ b/sys/arch/x86/include/pci_machdep.h
+@@ -36,7 +36,7 @@
+ /*
+  * Types provided to machine-independent PCI code
+  */
+-typedef int pci_intr_handle_t;
++typedef uint64_t pci_intr_handle_t;
+ 
+ #include <x86/pci_machdep_common.h>
+ 
+diff --git a/sys/arch/x86/include/pci_machdep_common.h b/sys/arch/x86/include/pci_machdep_common.h
+index 535fe98..2bb3663 100644
+--- a/sys/arch/x86/include/pci_machdep_common.h
++++ b/sys/arch/x86/include/pci_machdep_common.h
+@@ -110,6 +110,10 @@ void		pci_conf_write(pci_chipset_tag_t, pcitag_t, int,
+ 		    pcireg_t);
+ int		pci_intr_map(const struct pci_attach_args *,
+ 		    pci_intr_handle_t *);
++int		pci_intr_alloc(const struct pci_attach_args *,
++		    pci_intr_handle_t **);
++void		pci_intr_release(pci_intr_handle_t *);
++
+ const char	*pci_intr_string(pci_chipset_tag_t, pci_intr_handle_t,
+ 		    char *, size_t);
+ const struct evcnt *pci_intr_evcnt(pci_chipset_tag_t, pci_intr_handle_t);
+@@ -120,8 +124,36 @@ void		*pci_intr_establish(pci_chipset_tag_t, pci_intr_handle_t,
+ void		pci_intr_disestablish(pci_chipset_tag_t, void *);
+ 
+ /* experimental MSI support */
++const char *pci_msi_string(pci_intr_handle_t, char *, size_t);
++int pci_msi_count(struct pci_attach_args *);
++int pci_msi_alloc(struct pci_attach_args *, pci_intr_handle_t **, int *);
++int pci_msi_alloc_exact(struct pci_attach_args *, pci_intr_handle_t **, int);
++void pci_msi_release(pci_intr_handle_t **, int);
++void *pci_msi_establish(pci_chipset_tag_t, pci_intr_handle_t,
++    int, int (*)(void *), void *);
++void *pci_msi_establish_xname(pci_chipset_tag_t, pci_intr_handle_t,
++    int, int (*)(void *), void *, const char *);
++void pci_msi_disestablish(pci_chipset_tag_t, void *);
++
++/* experimental MSI-X support */
++int pci_msix_count(struct pci_attach_args *);
++int pci_msix_alloc(struct pci_attach_args *, pci_intr_handle_t **, int *);
++int pci_msix_alloc_exact(struct pci_attach_args *, pci_intr_handle_t **, int);
++void pci_msix_release(pci_intr_handle_t **, int);
++void *pci_msix_establish(pci_chipset_tag_t, pci_intr_handle_t,
++    int, int (*)(void *), void *);
++void *pci_msix_establish_xname(pci_chipset_tag_t, pci_intr_handle_t,
++    int, int (*)(void *), void *, const char *);
++void pci_msix_disestablish(pci_chipset_tag_t, void *);
++int pci_msix_remap(pci_intr_handle_t *, int);
++
++void pci_any_intr_disestablish(pci_chipset_tag_t, void *);
++void pci_any_intr_release(pci_intr_handle_t **, int);
++
++#if 0
+ void *pci_msi_establish(struct pci_attach_args *, int, int (*)(void *), void *);
+ void pci_msi_disestablish(void *);
++#endif
+ 
+ /*
+  * ALL OF THE FOLLOWING ARE MACHINE-DEPENDENT, AND SHOULD NOT BE USED
+diff --git a/sys/arch/x86/include/pic.h b/sys/arch/x86/include/pic.h
+index 3a3f512..a9aba7d 100644
+--- a/sys/arch/x86/include/pic.h
++++ b/sys/arch/x86/include/pic.h
+@@ -22,6 +22,7 @@ struct pic {
+ 	struct intrstub *pic_level_stubs;
+ 	struct intrstub *pic_edge_stubs;
+ 	struct ioapic_softc *pic_ioapic; /* if pic_type == PIC_IOAPIC */
++	struct msipic *pic_msipic; /* if (pic_type == PIC_MSI) || (pic_type == PIC_MSIX) */
+ };
+ 
+ /*
+@@ -30,7 +31,9 @@ struct pic {
+ #define PIC_I8259	0
+ #define PIC_IOAPIC	1
+ #define PIC_LAPIC	2
+-#define PIC_SOFT	3
++#define PIC_MSI		3
++#define PIC_MSIX	4
++#define PIC_SOFT	5
+ 
+ extern struct pic i8259_pic;
+ extern struct pic local_pic;
+diff --git a/sys/arch/x86/pci/msipic.c b/sys/arch/x86/pci/msipic.c
+new file mode 100644
+index 0000000..18cb8d2
+--- /dev/null
++++ b/sys/arch/x86/pci/msipic.c
+@@ -0,0 +1,729 @@
++/*	$NetBSD$	*/
++
++/*
++ * Copyright (c) 2014 Internet Initiative Japan Inc.
++ * All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE NETBSD FOUNDATION, INC. AND CONTRIBUTORS
++ * ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
++ * TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
++ * PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE FOUNDATION OR CONTRIBUTORS
++ * BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
++ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
++ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
++ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
++ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
++ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
++ * POSSIBILITY OF SUCH DAMAGE.
++ */
++
++#include <sys/cdefs.h>
++__KERNEL_RCSID(0, "$NetBSD$");
++
++#include <sys/types.h>
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/kmem.h>
++#include <sys/malloc.h>
++#include <sys/mutex.h>
++
++#include <dev/pci/pcivar.h>
++
++#include <machine/i82489reg.h>
++#include <machine/i82093reg.h>
++#include <machine/i82093var.h>
++#include <machine/pic.h>
++#include <machine/lock.h>
++
++#include <x86/pci/msipic.h>
++
++#define BUS_SPACE_WRITE_FLUSH(pc, tag) (void)bus_space_read_4(pc, tag, 0)
++
++struct msipic {
++	int mp_bus;
++	int mp_dev;
++	int mp_fun;
++
++	int mp_devid;
++	int mp_veccnt;
++	/*
++	 * MSI vectors are simple sequential number 0 to mp_veccnt - 1.
++	 * So, MSI does *not* use "mp_msixtable". it is always NULL.
++	 *
++	 * The other hand, MSI-X vectors is complex because MSI-X can use
++	 * "remap". So, MSI-X use "mp_msixtable" which mange MSI-X table
++	 * index and MSI-X handle.
++	 * mp_msixtablei's index means MSI-X handle's "vecid"(=MSI_INT_VEC(pih))
++	 * mp_msixtablei[i] value means MSI-X table index
++	 * If device driver does "remap" msix, the index and the value
++	 * combination change. Furthermore, it may change mp_msixtablei size,
++	 * if the device driver "remap" to sparse index.
++	 */
++	int *mp_msixtablei;
++
++	struct pci_attach_args mp_pa;
++	bus_space_tag_t mp_bstag;
++	bus_space_handle_t mp_bshandle;
++	bus_size_t mp_bssize;
++	struct pic *mp_pic;
++
++	kmutex_t mp_lock;
++	LIST_ENTRY(msipic) mp_list;
++};
++
++static kmutex_t msipic_list_lock;
++static LIST_HEAD(, msipic) msipic_list =
++	LIST_HEAD_INITIALIZER(msipic_list);
++
++struct dev_seq {
++	bool using;
++	int last_used_bus;
++	int last_used_dev;
++	int last_used_fun;
++};
++#define NUM_MSI_DEVS 256
++static struct dev_seq dev_seq[NUM_MSI_DEVS];
++
++static int
++allocate_devid(struct pci_attach_args *pa)
++{
++	pci_chipset_tag_t pc = pa->pa_pc;
++	pcitag_t tag = pa->pa_tag;
++	int bus, dev, fun, i;
++
++	pci_decompose_tag(pc, tag, &bus, &dev, &fun);
++
++	/* if the device was once attached, use same devid */
++	for (i = 0; i < NUM_MSI_DEVS; i++) {
++		/* skip never used dev_seq[i] */
++		if (dev_seq[i].last_used_bus == 0 &&
++		    dev_seq[i].last_used_dev == 0 &&
++		    dev_seq[i].last_used_fun == 0)
++			break;
++
++		if (dev_seq[i].last_used_bus == bus &&
++		    dev_seq[i].last_used_dev == dev &&
++		    dev_seq[i].last_used_fun == fun) {
++			dev_seq[i].using = true;
++			return i;
++		}
++	}
++
++	for (i = 0; i < NUM_MSI_DEVS; i++) {
++		if (dev_seq[i].using == 0) {
++			dev_seq[i].using = true;
++			dev_seq[i].last_used_bus = bus;
++			dev_seq[i].last_used_dev = dev;
++			dev_seq[i].last_used_fun = fun;
++			return i;
++		}
++	}
++
++	aprint_normal("too many MSI devices.\n");
++	return -1;
++}
++
++static void
++release_devid(int devid)
++{
++	if (devid < 0 || NUM_MSI_DEVS <= devid) {
++		aprint_normal("%s: invalid device.\n", __func__);
++		return;
++	}
++
++	dev_seq[devid].using = false;
++	/* keep last_used_* */
++}
++
++struct pic *
++find_msi_pic(int devid)
++{
++	struct msipic *mpp;
++
++	mutex_enter(&msipic_list_lock);
++	LIST_FOREACH(mpp, &msipic_list, mp_list) {
++		if(mpp->mp_devid == devid) {
++			mutex_exit(&msipic_list_lock);
++			return mpp->mp_pic;
++		}
++	}
++	mutex_exit(&msipic_list_lock);
++	return NULL;
++}
++
++static struct pic *
++construct_common_msi_pic(struct pci_attach_args *pa, struct pic *pic_tmpl)
++{
++	struct pic *pic;
++	struct msipic *msipic;
++	pci_chipset_tag_t pc = pa->pa_pc;
++	pcitag_t tag = pa->pa_tag;
++	int devid;
++
++	devid = allocate_devid(pa);
++	if (devid == -1)
++		return NULL;
++
++	pic = kmem_zalloc(sizeof(*pic), KM_SLEEP);
++	if (pic == NULL) {
++		return NULL;
++	}
++	memcpy(pic, pic_tmpl, sizeof(*pic));
++
++	msipic = kmem_zalloc(sizeof(*msipic), KM_SLEEP);
++	if (msipic == NULL) {
++		kmem_free(pic, sizeof(*msipic));
++		return NULL;
++	}
++
++	pic->pic_msipic = msipic;
++	msipic->mp_pic = pic;
++	pci_decompose_tag(pc, tag,
++	    &msipic->mp_bus, &msipic->mp_dev, &msipic->mp_fun);
++	memcpy(&msipic->mp_pa, pa, sizeof(msipic->mp_pa));
++	msipic->mp_devid = devid;
++	mutex_init(&msipic->mp_lock, MUTEX_DEFAULT, IPL_NONE);
++	/*
++	 * pci_msi_alloc() must be called only ont time in the device driver.
++	 */
++	KASSERT(find_msi_pic(msipic->mp_devid) == NULL);
++
++	mutex_enter(&msipic_list_lock);
++	LIST_INSERT_HEAD(&msipic_list, msipic, mp_list);
++	mutex_exit(&msipic_list_lock);
++
++	return pic;
++}
++
++static void
++destruct_common_msi_pic(struct pic *msi_pic)
++{
++	struct msipic *msipic;
++
++	if (msi_pic == NULL)
++		return;
++
++	msipic = msi_pic->pic_msipic;
++	mutex_enter(&msipic_list_lock);
++	LIST_REMOVE(msipic, mp_list);
++	mutex_exit(&msipic_list_lock);
++
++	release_devid(msipic->mp_devid);
++	kmem_free(msipic, sizeof(*msipic));
++	kmem_free(msi_pic, sizeof(*msi_pic));
++}
++
++bool
++is_msi_pic(struct pic *pic)
++{
++	return (pic->pic_msipic != NULL);
++}
++
++int
++msi_get_devid(struct pic *pic)
++{
++	KASSERT(is_msi_pic(pic));
++
++	return pic->pic_msipic->mp_devid;
++}
++
++static int
++msix_get_table_index(struct pic *pic, int vecid)
++{
++	KASSERT(pic->pic_msipic != NULL);
++	KASSERT(pic->pic_type == PIC_MSIX);
++
++	return pic->pic_msipic->mp_msixtablei[vecid];
++}
++
++static struct pci_attach_args *
++get_msi_pci_attach_args(struct pic *pic)
++{
++	KASSERT(pic->pic_msipic != NULL);
++
++	return &pic->pic_msipic->mp_pa;
++}
++
++#define MSI_MSICTL_ENABLE 1
++#define MSI_MSICTL_DISABLE 0
++static void
++msi_set_msictl_enablebit(struct pic *pic, int pin, int flag)
++{
++	pci_chipset_tag_t pc = NULL;
++	struct pci_attach_args *pa = get_msi_pci_attach_args(pic);
++	pcitag_t tag = pa->pa_tag;
++	pcireg_t ctl;
++	int off;
++
++	/* should use Mask Bits? */
++	if (pci_get_capability(pc, tag, PCI_CAP_MSI, &off, NULL) == 0)
++		panic("%s: no msi capability", __func__);
++
++	ctl = pci_conf_read(pc, tag, off + PCI_MSI_CTL);
++	if (flag == MSI_MSICTL_ENABLE)
++		ctl |= PCI_MSI_CTL_MSI_ENABLE;
++	else
++		ctl &= ~PCI_MSI_CTL_MSI_ENABLE;
++
++	pci_conf_write(pc, tag, off, ctl);
++}
++
++static void
++msi_hwmask(struct pic *pic, int pin)
++{
++	msi_set_msictl_enablebit(pic, pin, MSI_MSICTL_DISABLE);
++}
++
++static void
++msi_hwunmask(struct pic *pic, int pin)
++{
++	msi_set_msictl_enablebit(pic, pin, MSI_MSICTL_ENABLE);
++}
++
++static void
++msi_addroute(struct pic *pic, struct cpu_info *ci,
++	     int pin, int vec, int type)
++{
++	pci_chipset_tag_t pc = NULL;
++	struct pci_attach_args *pa = get_msi_pci_attach_args(pic);
++	pcitag_t tag = pa->pa_tag;
++	pcireg_t addr, data, ctl;
++	int off;
++
++	if (pci_get_capability(pc, tag, PCI_CAP_MSI, &off, NULL) == 0)
++		panic("%s: no msi capability", __func__);
++
++	/*
++	 * see OpenBSD's cpu_attach().
++	 * OpenBSD's ci->ci_apicid is equal to NetBSD's ci_cpuid.
++	 * What's mean OpenBSD's ci->ci_cpuid? the value is sc->sc_dev.dv_unit.
++	 */
++	addr = LAPIC_MSIADDR_BASE | __SHIFTIN(ci->ci_cpuid, LAPIC_MSIADDR_DSTID_MASK);
++	/*if triger mode is edge, it don't care level for trigger mode. */
++	data = __SHIFTIN(vec, LAPIC_MSIDATA_VECTOR_MASK) |
++		LAPIC_MSIDATA_TRGMODE_EDGE | LAPIC_MSIDATA_DM_FIXED;
++
++	ctl = pci_conf_read(pc, tag, off + PCI_MSI_CTL);
++
++	if (ctl & PCI_MSI_CTL_64BIT_ADDR) {
++		pci_conf_write(pc, tag, off + PCI_MSI_MADDR64_LO, addr);
++		pci_conf_write(pc, tag, off + PCI_MSI_MADDR64_HI, 0);
++		pci_conf_write(pc, tag, off + PCI_MSI_MDATA64, data);
++	} else {
++		pci_conf_write(pc, tag, off + PCI_MSI_MADDR, addr);
++		pci_conf_write(pc, tag, off + PCI_MSI_MDATA, data);
++	}
++	ctl |= PCI_MSI_CTL_MSI_ENABLE;
++	pci_conf_write(pc, tag, off + PCI_MSI_CTL, ctl);
++}
++
++static void
++msi_delroute(struct pic *pic, struct cpu_info *ci,
++	     int pin, int vec, int type)
++{
++	msi_hwmask(pic, pin);
++}
++
++static struct pic msi_pic_tmpl = {
++	.pic_name = "msi",
++	.pic_type = PIC_MSI,
++	.pic_vecbase = 0,
++	.pic_apicid = 0,
++	.pic_lock = __SIMPLELOCK_UNLOCKED,
++	.pic_hwmask = msi_hwmask,
++	.pic_hwunmask = msi_hwunmask,
++	.pic_addroute = msi_addroute,
++	.pic_delroute = msi_delroute,
++	.pic_edge_stubs = ioapic_edge_stubs,
++	.pic_ioapic = NULL,
++};
++
++struct pic *
++construct_msi_pic(struct pci_attach_args *pa)
++{
++	return construct_common_msi_pic(pa, &msi_pic_tmpl);
++}
++
++void
++destruct_msi_pic(struct pic *msi_pic)
++{
++	destruct_common_msi_pic(msi_pic);
++}
++
++#define MSIX_VECCTL_HWMASK 1
++#define MSIX_VECCTL_HWUNMASK 0
++static void
++msix_set_vecctl_mask(struct pic *pic, int pin, int flag)
++{
++	pci_chipset_tag_t pc = NULL;
++	struct pci_attach_args *pa = get_msi_pci_attach_args(pic);
++	pcitag_t tag = pa->pa_tag;
++	pcireg_t reg;
++	uint64_t table_off;
++	uint64_t entry_base;
++	uint32_t vecctl;
++	pcireg_t tbl;
++	int off;
++
++	bus_space_tag_t bstag = pic->pic_msipic->mp_bstag;
++	bus_space_handle_t bshandle = pic->pic_msipic->mp_bshandle;
++	int table_idx;
++
++	table_idx = msix_get_table_index(pic, pin);
++	if (table_idx < 0)
++		panic("%s: invalid MSI-X table index, devid=%d vecid=%d",
++		    __func__, msi_get_devid(pic), pin);
++
++	if (pci_get_capability(pc, tag, PCI_CAP_MSIX, &off, &reg) == 0)
++		panic("%s: no msix capability", __func__);
++	tbl = pci_conf_read(pc, tag, off + PCI_MSIX_TBLOFFSET);
++	table_off = tbl & PCI_MSIX_TBLOFFSET_MASK;
++
++	entry_base = table_off +
++		PCI_MSIX_TABLE_ENTRY_SIZE * table_idx;
++
++	vecctl = bus_space_read_4(bstag, bshandle,
++	    entry_base + PCI_MSIX_TABLE_ENTRY_VECTCTL);
++	if (flag == MSIX_VECCTL_HWMASK)
++		vecctl |= PCI_MSIX_VECTCTL_HWMASK_MASK;
++	else
++		vecctl &= ~PCI_MSIX_VECTCTL_HWMASK_MASK;
++
++	bus_space_write_4(bstag, bshandle,
++	    entry_base + PCI_MSIX_TABLE_ENTRY_VECTCTL, vecctl);
++	BUS_SPACE_WRITE_FLUSH(bstag, bshandle);
++}
++
++static void
++msix_hwmask(struct pic *pic, int pin)
++{
++	msix_set_vecctl_mask(pic, pin, MSIX_VECCTL_HWMASK);
++}
++
++static void
++msix_hwunmask(struct pic *pic, int pin)
++{
++	msix_set_vecctl_mask(pic, pin, MSIX_VECCTL_HWUNMASK);
++}
++
++static void
++msix_addroute(struct pic *pic, struct cpu_info *ci,
++	     int pin, int vec, int type)
++{
++	struct pci_attach_args *pa = get_msi_pci_attach_args(pic);
++	pci_chipset_tag_t pc = pa->pa_pc;
++	pcitag_t tag = pa->pa_tag;
++	uint64_t table_off;
++	uint64_t entry_base;
++	pcireg_t tbl, addr, data, ctl;
++	int off;
++
++	bus_space_tag_t bstag = pic->pic_msipic->mp_bstag;
++	bus_space_handle_t bshandle = pic->pic_msipic->mp_bshandle;
++	int table_idx;
++
++	table_idx = msix_get_table_index(pic, pin);
++	if (table_idx < 0)
++		panic("%s: invalid MSI-X table index, devid=%d vecid=%d",
++		    __func__, msi_get_devid(pic), pin);
++
++	if (pci_get_capability(pc, tag, PCI_CAP_MSIX, &off, NULL) == 0)
++		panic("%s: no msix capability", __func__);
++	tbl = pci_conf_read(pc, tag, off + PCI_MSIX_TBLOFFSET);
++	table_off = tbl & PCI_MSIX_TBLOFFSET_MASK;
++
++	entry_base = table_off +
++		PCI_MSIX_TABLE_ENTRY_SIZE * table_idx;
++
++	/*
++	 * see OpenBSD's cpu_attach().
++	 * OpenBSD's ci->ci_apicid is equal to NetBSD's ci_cpuid.
++	 * What's mean OpenBSD's ci->ci_cpuid? the value is sc->sc_dev.dv_unit.
++	 */
++	addr = LAPIC_MSIADDR_BASE | __SHIFTIN(ci->ci_cpuid, LAPIC_MSIADDR_DSTID_MASK);
++	/*if triger mode is edge, it don't care level for trigger mode. */
++	data = __SHIFTIN(vec, LAPIC_MSIDATA_VECTOR_MASK) |
++		LAPIC_MSIDATA_TRGMODE_EDGE | LAPIC_MSIDATA_DM_FIXED;
++
++	bus_space_write_4(bstag, bshandle,
++	    entry_base + PCI_MSIX_TABLE_ENTRY_ADDR_LO, addr);
++	bus_space_write_4(bstag, bshandle,
++	    entry_base + PCI_MSIX_TABLE_ENTRY_ADDR_HI, 0);
++	bus_space_write_4(bstag, bshandle,
++	    entry_base + PCI_MSIX_TABLE_ENTRY_DATA, data);
++	bus_space_write_4(bstag, bshandle,
++	    entry_base + PCI_MSIX_TABLE_ENTRY_VECTCTL, 0);
++	BUS_SPACE_WRITE_FLUSH(bstag, bshandle);
++
++	ctl = pci_conf_read(pc, tag, off + PCI_MSIX_CTL);
++
++	ctl |= PCI_MSIX_CTL_ENABLE;
++	pci_conf_write(pc, tag, off + PCI_MSIX_CTL, ctl);
++}
++
++static void
++msix_delroute(struct pic *pic, struct cpu_info *ci,
++	     int pin, int vec, int type)
++{
++	msix_hwmask(pic, pin);
++}
++
++static struct pic msix_pic_tmpl = {
++	.pic_name = "msix",
++	.pic_type = PIC_MSIX,
++	.pic_vecbase = 0,
++	.pic_apicid = 0,
++	.pic_lock = __SIMPLELOCK_UNLOCKED,
++	.pic_hwmask = msix_hwmask,
++	.pic_hwunmask = msix_hwunmask,
++	.pic_addroute = msix_addroute,
++	.pic_delroute = msix_delroute,
++	.pic_edge_stubs = ioapic_edge_stubs,
++};
++
++struct pic *
++construct_msix_pic(struct pci_attach_args *pa)
++{
++	pci_chipset_tag_t pc = pa->pa_pc;
++	pcitag_t tag = pa->pa_tag;
++	pcireg_t tbl;
++	bus_space_tag_t bstag;
++	bus_space_handle_t bshandle;
++	bus_size_t bssize;
++	u_int memtype;
++	int off, bir, bar, err;
++	struct pic *msix_pic;
++
++	msix_pic = construct_common_msi_pic(pa, &msix_pic_tmpl);
++	if (msix_pic == NULL) {
++		aprint_normal("cannot allocate MSI-X pic.\n");
++		return NULL;
++	}
++
++	if (pci_get_capability(pc, tag, PCI_CAP_MSIX, &off, NULL) == 0) {
++		aprint_normal("%s: no msix capability", __func__);
++		return NULL;
++	}
++	tbl = pci_conf_read(pc, tag, off + PCI_MSIX_TBLOFFSET);
++	bir = tbl & PCI_MSIX_PBABIR_MASK;
++	switch(bir) {
++	case 0:
++		bar = PCI_BAR0;
++		break;
++	case 1:
++		bar = PCI_BAR1;
++		break;
++	case 2:
++		bar = PCI_BAR2;
++		break;
++	case 3:
++		bar = PCI_BAR3;
++		break;
++	case 4:
++		bar = PCI_BAR4;
++		break;
++	case 5:
++		bar = PCI_BAR5;
++		break;
++	default:
++		aprint_normal("the device use reserved BIR values.\n");
++		return NULL;
++	}
++	memtype = pci_mapreg_type(pc, tag, bar);
++	err = pci_mapreg_map(pa, bar, memtype, BUS_SPACE_MAP_LINEAR,
++	    &bstag, &bshandle, NULL, &bssize);
++	if (err) {
++		aprint_normal("cannot map msix table.\n");
++		return NULL;
++	}
++	msix_pic->pic_msipic->mp_bstag = bstag;
++	msix_pic->pic_msipic->mp_bshandle = bshandle;
++	msix_pic->pic_msipic->mp_bssize = bssize;
++
++	return msix_pic;
++}
++
++void
++destruct_msix_pic(struct pic *msix_pic)
++{
++	struct msipic *msipic;
++
++	KASSERT(is_msi_pic(msix_pic));
++	KASSERT(msix_pic->pic_type == PIC_MSIX);
++
++	msipic = msix_pic->pic_msipic;
++	bus_space_unmap(msipic->mp_bstag, msipic->mp_bshandle,
++	    msipic->mp_bssize);
++
++	if (msipic->mp_msixtablei != NULL)
++		kmem_free(msipic->mp_msixtablei,
++		    sizeof(msipic->mp_msixtablei[0]) * msipic->mp_veccnt);
++	msipic->mp_msixtablei = NULL;
++
++	destruct_common_msi_pic(msix_pic);
++}
++
++int
++set_msi_vectors(struct pic *msi_pic, pci_intr_handle_t *pihs, int count)
++{
++	int i;
++	int *vecs;
++
++	KASSERT(is_msi_pic(msi_pic));
++
++	if (msi_pic->pic_type == PIC_MSI) {
++		aprint_normal("MSI ignore vecs parameter.\n");
++		vecs = NULL;
++	}
++	else if (msi_pic->pic_type == PIC_MSIX) {
++		vecs = kmem_zalloc(sizeof(int) * (count), KM_SLEEP);
++		if (vecs == NULL) {
++			aprint_normal("cannot allocate MSI-X vector table.\n");
++			return 1;
++		}
++
++		for (i = 0; i < count; i++) {
++			vecs[i] = MSI_INT_VEC(pihs[i]);
++		}
++	}
++	else {
++		aprint_normal("invalid MSI type.\n");
++		return 1;
++	}
++
++	msi_pic->pic_msipic->mp_veccnt = count;
++	msi_pic->pic_msipic->mp_msixtablei = vecs;
++	return 0;
++}
++
++int
++remap_msix_vectors(struct pic *msi_pic, pci_intr_handle_t *pihs, int count)
++{
++	struct pci_attach_args *pa = get_msi_pci_attach_args(msi_pic);
++	pci_chipset_tag_t pc = pa->pa_pc;
++	pcitag_t tag = pa->pa_tag;
++	struct msipic *msipic = msi_pic->pic_msipic;
++	bus_space_tag_t bstag = msipic->mp_bstag;
++	bus_space_handle_t bshandle = msipic->mp_bshandle;
++	uint64_t table_off;
++	pcireg_t tbl;
++	int off;
++	int newseq, oldseq, table_idx, veccnt;
++	int *vecs;
++	struct pci_msix_table_entry *newtable;
++
++	if (pihs == NULL)
++		return 1;
++
++	vecs = kmem_zalloc(sizeof(int) * count, KM_SLEEP);
++	if (vecs == NULL) {
++		aprint_normal("cannot allocate mp_msixtablei.\n");
++		return 1;
++	}
++
++	newtable = kmem_zalloc(sizeof(struct pci_msix_table_entry) * count,
++	    KM_SLEEP);
++	if (newtable == NULL) {
++		aprint_normal("cannot allocate MSI-X vector table.\n");
++		kmem_free(vecs, sizeof(int) * count);
++		return 1;
++	}
++
++	if (pci_get_capability(pc, tag, PCI_CAP_MSIX, &off, NULL) == 0)
++		panic("%s: no msix capability", __func__);
++	tbl = pci_conf_read(pc, tag, off + PCI_MSIX_TBLOFFSET);
++	table_off = tbl & PCI_MSIX_TBLOFFSET_MASK;
++
++	/* setup new mp_veccnt and mp_msixtablei */
++	veccnt = count;
++	for (newseq = 0; newseq < count; newseq++) {
++		if (pihs[newseq] == MSI_INT_MSIX_INVALID) {
++			vecs[newseq] = -1;
++			veccnt -= 1;
++		} else
++			vecs[newseq] = MSI_INT_VEC(pihs[newseq]);
++	}
++
++	mutex_enter(&msipic->mp_lock);
++
++	/* setup new MSI-X table */
++	for (table_idx = 0; table_idx < count; table_idx++) {
++		uint32_t addr_lo, addr_hi, data, vecctl;
++		bool existing = false;
++
++		for (oldseq = 0; oldseq < msipic->mp_veccnt; oldseq++) {
++			if (msipic->mp_msixtablei[oldseq] == table_idx) {
++				existing = true;
++				break;
++			}
++		}
++
++		if (existing) {
++			uint64_t entry_base = table_off +
++				PCI_MSIX_TABLE_ENTRY_SIZE * table_idx;
++			addr_lo = bus_space_read_4(bstag, bshandle,
++			    entry_base + PCI_MSIX_TABLE_ENTRY_ADDR_LO);
++			addr_hi = bus_space_read_4(bstag, bshandle,
++			    entry_base + PCI_MSIX_TABLE_ENTRY_ADDR_HI);
++			data = bus_space_read_4(bstag, bshandle,
++			    entry_base + PCI_MSIX_TABLE_ENTRY_DATA);
++			vecctl = bus_space_read_4(bstag, bshandle,
++			    entry_base + PCI_MSIX_TABLE_ENTRY_VECTCTL);
++		} else {
++			addr_lo = 0;
++			addr_hi = 0;
++			data = 0;
++			vecctl = PCI_MSIX_VECTCTL_HWMASK_MASK;
++		}
++		newtable[table_idx].pci_msix_addr_lo = addr_lo;
++		newtable[table_idx].pci_msix_addr_hi = addr_hi;
++		newtable[table_idx].pci_msix_value = data;
++		newtable[table_idx].pci_msix_vector_control = vecctl;
++	}
++
++	/* write new MSI-X table */
++	for (table_idx = 0; table_idx < count; table_idx++) {
++			uint64_t entry_base;
++
++		entry_base = table_off + PCI_MSIX_TABLE_ENTRY_SIZE * table_idx;
++		bus_space_write_4(bstag, bshandle,
++		    entry_base + PCI_MSIX_TABLE_ENTRY_ADDR_LO,
++		    newtable[table_idx].pci_msix_addr_lo);
++		bus_space_write_4(bstag, bshandle,
++		    entry_base + PCI_MSIX_TABLE_ENTRY_ADDR_HI,
++		    newtable[table_idx].pci_msix_addr_hi);
++		bus_space_write_4(bstag, bshandle,
++		    entry_base + PCI_MSIX_TABLE_ENTRY_DATA,
++		    newtable[table_idx].pci_msix_value);
++		bus_space_write_4(bstag, bshandle,
++		    entry_base + PCI_MSIX_TABLE_ENTRY_VECTCTL,
++		    newtable[table_idx].pci_msix_vector_control);
++	}
++	BUS_SPACE_WRITE_FLUSH(bstag, bshandle);
++
++	/* swap msipic members */
++	kmem_free(msipic->mp_msixtablei, sizeof(int) * msipic->mp_veccnt);
++	msi_pic->pic_msipic->mp_veccnt = veccnt;
++	msi_pic->pic_msipic->mp_msixtablei = vecs;
++
++	mutex_exit(&msipic->mp_lock);
++
++	kmem_free(newtable, sizeof(struct pci_msix_table_entry) * count);
++	return 0;
++}
++
++void
++msipic_init(void)
++{
++	mutex_init(&msipic_list_lock, MUTEX_DEFAULT, IPL_NONE);
++}
+diff --git a/sys/arch/x86/pci/msipic.h b/sys/arch/x86/pci/msipic.h
+new file mode 100644
+index 0000000..d80a853
+--- /dev/null
++++ b/sys/arch/x86/pci/msipic.h
+@@ -0,0 +1,48 @@
++/*	$NetBSD$	*/
++
++/*
++ * Copyright (c) 2014 Internet Initiative Japan Inc.
++ * All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE NETBSD FOUNDATION, INC. AND CONTRIBUTORS
++ * ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
++ * TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
++ * PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE FOUNDATION OR CONTRIBUTORS
++ * BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
++ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
++ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
++ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
++ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
++ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
++ * POSSIBILITY OF SUCH DAMAGE.
++ */
++
++#ifndef _X86_PCI_MSIPIC_H_
++#define _X86_PCI_MSIPIC_H_
++
++#include <dev/pci/pcivar.h>
++
++struct pic *construct_msi_pic(struct pci_attach_args *);
++void destruct_msi_pic(struct pic *);
++struct pic *construct_msix_pic(struct pci_attach_args *);
++void destruct_msix_pic(struct pic *);
++struct pic *find_msi_pic(int);
++void delete_common_msi_pic(struct pic *);
++int set_msi_vectors(struct pic *, pci_intr_handle_t *, int);
++int remap_msix_vectors(struct pic *, pci_intr_handle_t *, int);
++
++bool is_msi_pic(struct pic *);
++int msi_get_devid(struct pic *);
++
++void msipic_init(void);
++
++#endif /* _X86_PCI_MSIPIC_H_ */
+diff --git a/sys/arch/x86/pci/pci_intr_machdep.c b/sys/arch/x86/pci/pci_intr_machdep.c
+index 6bbb8ea..d127358 100644
+--- a/sys/arch/x86/pci/pci_intr_machdep.c
++++ b/sys/arch/x86/pci/pci_intr_machdep.c
+@@ -79,9 +79,11 @@ __KERNEL_RCSID(0, "$NetBSD: pci_intr_machdep.c,v 1.27 2014/03/29 19:28:30 christ
+ #include <sys/param.h>
+ #include <sys/time.h>
+ #include <sys/systm.h>
++#include <sys/cpu.h>
+ #include <sys/errno.h>
+ #include <sys/device.h>
+ #include <sys/intr.h>
++#include <sys/kmem.h>
+ #include <sys/malloc.h>
+ 
+ #include <dev/pci/pcivar.h>
+@@ -110,11 +112,10 @@ __KERNEL_RCSID(0, "$NetBSD: pci_intr_machdep.c,v 1.27 2014/03/29 19:28:30 christ
+ #include <machine/mpacpi.h>
+ #endif
+ 
+-#define	MPSAFE_MASK	0x80000000
+-
+ int
+-pci_intr_map(const struct pci_attach_args *pa, pci_intr_handle_t *ihp)
++pci_intr_map(const struct pci_attach_args *pa, pci_intr_handle_t *pihp)
+ {
++	int *ihp = (int *)pihp; /* IRQ interrupts use lower 32bit only */
+ 	int pin = pa->pa_intrpin;
+ 	int line = pa->pa_intrline;
+ 	pci_chipset_tag_t ipc, pc = pa->pa_pc;
+@@ -126,7 +127,7 @@ pci_intr_map(const struct pci_attach_args *pa, pci_intr_handle_t *ihp)
+ 	for (ipc = pc; ipc != NULL; ipc = ipc->pc_super) {
+ 		if ((ipc->pc_present & PCI_OVERRIDE_INTR_MAP) == 0)
+ 			continue;
+-		return (*ipc->pc_ov->ov_intr_map)(ipc->pc_ctx, pa, ihp);
++		return (*ipc->pc_ov->ov_intr_map)(ipc->pc_ctx, pa, pihp);
+ 	}
+ 
+ 	if (pin == 0) {
+@@ -219,12 +220,66 @@ bad:
+ 	return 1;
+ }
+ 
++int
++pci_intr_alloc(const struct pci_attach_args *pa, pci_intr_handle_t **pih)
++{
++	struct intrsource *isp;
++	const char *intrstr;
++	char intrstr_buf[INTRID_LEN + 1];
++	pci_intr_handle_t *handle;
++
++	handle = kmem_zalloc(sizeof(handle), KM_SLEEP);
++	if (handle == NULL) {
++		aprint_normal("cannot allocate pci_intr_handle_t\n");
++		return 1;
++	}
++
++	if (pci_intr_map(pa, handle) != 0) {
++		aprint_normal("cannot set up pci_intr_handle_t\n");
++		return 1;
++	}
++
++	intrstr = pci_intr_string(pa->pa_pc, *handle,
++	    intrstr_buf, sizeof(intrstr_buf));
++	mutex_enter(&cpu_lock);
++	isp = intr_allocate_io_intrsource(intrstr);
++	if (isp == NULL) {
++		aprint_normal("can't allocate io_intersource\n");
++		return 1;
++	}
++	mutex_exit(&cpu_lock);
++
++	*pih = handle;
++	return 0;
++}
++
++void
++pci_intr_release(pci_intr_handle_t *pih)
++{
++	const char *intrstr;
++	char intrstr_buf[INTRID_LEN + 1];
++
++	if (pih == NULL)
++		return;
++
++	/* XXXX ov_intr_disestablish() care? */
++	intrstr = pci_intr_string(NULL, *pih, intrstr_buf, sizeof(intrstr_buf));
++	mutex_enter(&cpu_lock);
++	intr_free_io_intrsource(intrstr);
++	mutex_exit(&cpu_lock);
++
++	kmem_free(pih, sizeof(*pih));
++}
++
+ const char *
+ pci_intr_string(pci_chipset_tag_t pc, pci_intr_handle_t ih, char *buf,
+     size_t len)
+ {
+ 	pci_chipset_tag_t ipc;
+ 
++	if (INT_VIA_MSI(ih))
++		return pci_msi_string(ih, buf, len);
++
+ 	for (ipc = pc; ipc != NULL; ipc = ipc->pc_super) {
+ 		if ((ipc->pc_present & PCI_OVERRIDE_INTR_STRING) == 0)
+ 			continue;
+@@ -290,7 +345,7 @@ pci_intr_establish_xname(pci_chipset_tag_t pc, pci_intr_handle_t ih,
+ 	}
+ 
+ 	pic = &i8259_pic;
+-	pin = irq = (ih & ~MPSAFE_MASK);
++	pin = irq = ((int)ih & ~MPSAFE_MASK);
+ 	mpsafe = ((ih & MPSAFE_MASK) != 0);
+ 
+ #if NIOAPIC > 0
+@@ -335,6 +390,7 @@ pci_intr_disestablish(pci_chipset_tag_t pc, void *cookie)
+ 	intr_disestablish(cookie);
+ }
+ 
++#if 0
+ #if NIOAPIC > 0
+ /*
+  * experimental support for MSI, does support a single vector,
+@@ -342,7 +398,6 @@ pci_intr_disestablish(pci_chipset_tag_t pc, void *cookie)
+  * (while it doesn't need the ioapic technically, it borrows
+  * from its kernel support)
+  */
+-
+ /* dummies, needed by common intr_establish code */
+ static void
+ msipic_hwmask(struct pic *pic, int pin)
+@@ -438,3 +493,4 @@ pci_msi_disestablish(void *ih)
+ 	free(msih, M_DEVBUF);
+ }
+ #endif
++#endif
+diff --git a/sys/arch/x86/pci/pci_machdep.c b/sys/arch/x86/pci/pci_machdep.c
+index f6414fd..1aac6d4 100644
+--- a/sys/arch/x86/pci/pci_machdep.c
++++ b/sys/arch/x86/pci/pci_machdep.c
+@@ -126,6 +126,8 @@ __KERNEL_RCSID(0, "$NetBSD: pci_machdep.c,v 1.68 2014/11/05 05:07:43 christos Ex
+ #include <x86/vga_post.h>
+ #endif
+ 
++#include <x86/cpuvar.h>
++
+ #include <machine/autoconf.h>
+ #include <machine/bootinfo.h>
+ 
+@@ -210,6 +212,55 @@ const struct {
+ #undef _tag
+ #undef _qe
+ 
++#define PCI_QUIRK_DISABLE_MSI	1 /* Neigher MSI nor MSI-X work */
++#define PCI_QUIRK_DISABLE_MSIX	2 /* MSI-X does not work */
++#define PCI_QUIRK_ENABLE_MSI_VM	3 /* Older chipset in VM where MSI and MSI-X works */
++
++#define _dme(vend, prod) \
++	{ PCI_QUIRK_DISABLE_MSI, PCI_ID_CODE(vend, prod) }
++#define _dmxe(vend, prod) \
++	{ PCI_QUIRK_DISABLE_MSI, PCI_ID_CODE(vend, prod) }
++#define _emve(vend, prod) \
++	{ PCI_QUIRK_ENABLE_MSI_VM, PCI_ID_CODE(vend, prod) }
++const struct {
++	int type;
++	pcireg_t id;
++} pci_msi_quirk_tbl[] = {
++	_dme(PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_PCMC),
++	_dme(PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_82437FX),
++	_dme(PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_82437MX),
++	_dme(PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_82437VX),
++	_dme(PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_82439HX),
++	_dme(PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_82439TX),
++	_dme(PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_82443GX),
++	_dme(PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_82443GX_AGP),
++	_dme(PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_82440MX),
++	_dme(PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_82441FX),
++	_dme(PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_82443BX),
++	_dme(PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_82443BX_AGP),
++	_dme(PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_82443BX_NOAGP),
++	_dme(PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_82443GX_NOAGP),
++	_dme(PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_82443LX),
++	_dme(PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_82443LX_AGP),
++	_dme(PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_82810_MCH),
++	_dme(PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_82810E_MCH),
++	_dme(PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_82815_FULL_HUB),
++	_dme(PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_82820_MCH),
++	_dme(PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_82830MP_IO_1),
++	_dme(PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_82840_HB),
++	_dme(PCI_VENDOR_NVIDIA, PCI_PRODUCT_NVIDIA_NFORCE_PCHB),
++	_dme(PCI_VENDOR_NVIDIA, PCI_PRODUCT_NVIDIA_NFORCE2_PCHB),
++	_dme(PCI_VENDOR_AMD, PCI_PRODUCT_AMD_SC751_SC),
++	_dme(PCI_VENDOR_AMD, PCI_PRODUCT_AMD_SC761_SC),
++	_dme(PCI_VENDOR_AMD, PCI_PRODUCT_AMD_SC762_NB),
++
++	_emve(PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_82441FX), /* QEMU */
++	_emve(PCI_VENDOR_INTEL, PCI_PRODUCT_INTEL_82443BX), /* VMWare */
++};
++#undef _dme
++#undef _dmxe
++#undef _emve
++
+ /*
+  * PCI doesn't have any special needs; just use the generic versions
+  * of these functions.
+@@ -370,9 +421,26 @@ pci_conf_select(uint32_t sel)
+ 	}
+ }
+ 
++static int
++pci_has_msi_quirk(pcireg_t id, int type)
++{
++	int i;
++
++	for (i = 0; i < __arraycount(pci_msi_quirk_tbl); i++) {
++		if (id == pci_msi_quirk_tbl[i].id &&
++		    type == pci_msi_quirk_tbl[i].type)
++			return 1;
++	}
++
++	return 0;
++}
++
+ void
+ pci_attach_hook(device_t parent, device_t self, struct pcibus_attach_args *pba)
+ {
++	pci_chipset_tag_t pc = pba->pba_pc;
++	pcitag_t tag;
++	pcireg_t id, class;
+ 
+ 	if (pba->pba_bus == 0)
+ 		aprint_normal(": configuration mode %d", pci_mode);
+@@ -382,6 +450,56 @@ pci_attach_hook(device_t parent, device_t self, struct pcibus_attach_args *pba)
+ #if NACPICA > 0
+ 	mpacpi_pci_attach_hook(parent, self, pba);
+ #endif
++
++	/*
++	 * In order to decide whether the system supports MSI we look
++	 * at the host bridge, which should be device 0 function 0 on
++	 * bus 0.  It is better to not enable MSI on systems that
++	 * support it than the other way around, so be conservative
++	 * here.  So we don't enable MSI if we don't find a host
++	 * bridge there.  We also deliberately don't enable MSI on
++	 * chipsets from low-end manifacturers like VIA and SiS.
++	 */
++	tag = pci_make_tag(pc, 0, 0, 0);
++	id = pci_conf_read(pc, tag, PCI_ID_REG);
++	class = pci_conf_read(pc, tag, PCI_CLASS_REG);
++
++	if (PCI_CLASS(class) != PCI_CLASS_BRIDGE ||
++	    PCI_SUBCLASS(class) != PCI_SUBCLASS_BRIDGE_HOST)
++		return;
++
++	if (pci_has_msi_quirk(id, PCI_QUIRK_DISABLE_MSI)) {
++		pba->pba_flags &= ~PCI_FLAGS_MSI_OKAY;
++		pba->pba_flags &= ~PCI_FLAGS_MSIX_OKAY;
++	} else if (pci_has_msi_quirk(id, PCI_QUIRK_DISABLE_MSIX)) {
++		pba->pba_flags |= PCI_FLAGS_MSI_OKAY;
++		pba->pba_flags &= ~PCI_FLAGS_MSIX_OKAY;
++	} else {
++		pba->pba_flags |= PCI_FLAGS_MSI_OKAY;
++		pba->pba_flags |= PCI_FLAGS_MSIX_OKAY;
++	}
++
++	/* VMware and KVM use old chipset, but they can use MSI/MSI-X */
++	if (cpu_feature[1] & CPUID2_RAZ) {
++		if (pci_has_msi_quirk(id, PCI_QUIRK_ENABLE_MSI_VM)) {
++			pba->pba_flags |= PCI_FLAGS_MSI_OKAY;
++			pba->pba_flags |= PCI_FLAGS_MSIX_OKAY;
++		}
++	}
++
++	/*
++	 * Don't enable MSI on a HyperTransport bus.  In order to
++	 * determine that bus 0 is a HyperTransport bus, we look at
++	 * device 24 function 0, which is the HyperTransport
++	 * host/primary interface integrated on most 64-bit AMD CPUs.
++	 * If that device has a HyperTransport capability, bus 0 must
++	 * be a HyperTransport bus and we disable MSI.
++	 */
++	tag = pci_make_tag(pc, 0, 24, 0);
++	if (pci_get_capability(pc, tag, PCI_CAP_LDT, NULL, NULL)) {
++		pba->pba_flags &= ~PCI_FLAGS_MSI_OKAY;
++		pba->pba_flags &= ~PCI_FLAGS_MSIX_OKAY;
++	}
+ }
+ 
+ int
+diff --git a/sys/arch/x86/pci/pci_msi_machdep.c b/sys/arch/x86/pci/pci_msi_machdep.c
+new file mode 100644
+index 0000000..659e430db
+--- /dev/null
++++ b/sys/arch/x86/pci/pci_msi_machdep.c
+@@ -0,0 +1,627 @@
++/*	$NetBSD$	*/
++
++/*
++ * Copyright (c) 2014 Internet Initiative Japan Inc.
++ * All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE NETBSD FOUNDATION, INC. AND CONTRIBUTORS
++ * ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
++ * TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
++ * PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE FOUNDATION OR CONTRIBUTORS
++ * BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
++ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
++ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
++ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
++ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
++ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
++ * POSSIBILITY OF SUCH DAMAGE.
++ */
++
++/*
++ * TODO
++ *
++ *     - PBA (Pending Bit Array) support
++ *     - HyperTransport mapping support
++ */
++
++#include <sys/cdefs.h>
++__KERNEL_RCSID(0, "$NetBSD$");
++
++#include <sys/types.h>
++#include <sys/param.h>
++#include <sys/time.h>
++#include <sys/systm.h>
++#include <sys/cpu.h>
++#include <sys/errno.h>
++#include <sys/device.h>
++#include <sys/intr.h>
++#include <sys/kmem.h>
++#include <sys/malloc.h>
++
++#include <dev/pci/pcivar.h>
++
++#include <machine/i82093var.h>
++#include <machine/pic.h>
++
++#include <x86/pci/msipic.h>
++
++const char *
++pci_msi_string(pci_intr_handle_t ih, char *buf, size_t len)
++{
++	int dev, vec;
++
++	KASSERT(INT_VIA_MSI(ih));
++
++	dev = MSI_INT_DEV(ih);
++	vec = MSI_INT_VEC(ih);
++	if (MSI_INT_IS_MSIX(ih))
++		snprintf(buf, len, "msix%d vec %d", dev, vec);
++	else
++		snprintf(buf, len, "msi%d vec %d", dev, vec);
++
++	return buf;
++}
++
++static pci_intr_handle_t
++pci_msi_calculate_handle(struct pic *msi_pic, int vector)
++{
++	pci_intr_handle_t handle;
++
++	KASSERT(is_msi_pic(msi_pic));
++
++	handle = __SHIFTIN((uint64_t)msi_get_devid(msi_pic), MSI_INT_DEV_MASK) |
++		__SHIFTIN((uint64_t)vector, MSI_INT_VEC_MASK) | APIC_INT_VIA_MSI;
++	if (msi_pic->pic_type == PIC_MSI)
++		MSI_INT_MAKE_MSI(handle);
++	else if (msi_pic->pic_type == PIC_MSIX)
++		MSI_INT_MAKE_MSIX(handle);
++
++	return handle;
++}
++
++static pci_intr_handle_t *
++pci_msi_alloc_vectors(struct pic *msi_pic, int *count)
++{
++	struct intrsource *isp;
++	const char *intrstr;
++	char intrstr_buf[INTRID_LEN + 1];
++	pci_intr_handle_t *vectors;
++	pci_intr_handle_t pih;
++	int i;
++
++	vectors = kmem_zalloc(sizeof(vectors[0]) * (*count), KM_SLEEP);
++	if (vectors == NULL) {
++		aprint_normal("cannot allocate vectors\n");
++		return NULL;
++	}
++
++	mutex_enter(&cpu_lock);
++	for (i = 0; i < *count; i++) {
++		pih = pci_msi_calculate_handle(msi_pic, i);
++
++		intrstr = pci_msi_string(pih, intrstr_buf, sizeof(intrstr_buf));
++		isp = intr_allocate_io_intrsource(intrstr);
++		if (isp == NULL) {
++			aprint_normal("can't allocate io_intersource\n");
++			return NULL;
++		}
++
++		vectors[i] = pih;
++	}
++	mutex_exit(&cpu_lock);
++
++	return vectors;
++}
++
++static void
++pci_msi_free_vectors(struct pic *msi_pic, int count)
++{
++	const char *intrstr;
++	char intrstr_buf[INTRID_LEN + 1];
++	pci_intr_handle_t pih;
++	int i;
++
++	mutex_enter(&cpu_lock);
++	for (i = 0; i < count; i++) {
++		pih = pci_msi_calculate_handle(msi_pic, i);
++		intrstr = pci_msi_string(pih, intrstr_buf, sizeof(intrstr_buf));
++		intr_free_io_intrsource(intrstr);
++	}
++	mutex_exit(&cpu_lock);
++}
++
++static int
++pci_msi_alloc_md_common(pci_intr_handle_t **ihps, int *count,
++    struct pci_attach_args *pa, bool exact)
++{
++	int i, error;
++	struct pic *msi_pic;
++	pci_intr_handle_t *vectors = NULL;
++
++	if ((pa->pa_flags & PCI_FLAGS_MSI_OKAY) == 0) {
++		aprint_normal("PCI host bridge does not support MSI.\n");
++		return 1;
++	}
++
++	msi_pic = construct_msi_pic(pa);
++	if (msi_pic == NULL) {
++		aprint_normal("cannot allocate MSI pic.\n");
++		return 1;
++	}
++
++	while (*count > 0) {
++		vectors = pci_msi_alloc_vectors(msi_pic, count);
++		if (vectors == NULL) {
++			if (exact) {
++				aprint_normal("cannot allocate MSI vectors.\n");
++				return 1;
++			} else {
++				(*count) >>= 1; /* MSI must be power of 2. */
++				continue;
++			}
++		} else
++			break;
++	}
++	if (vectors == NULL) {
++		aprint_normal("cannot allocate MSI vectors.\n");
++		return 1;
++	}
++
++	for (i = 0; i < *count; i++) {
++		MSI_INT_MAKE_MSI(vectors[i]);
++	}
++
++	error = set_msi_vectors(msi_pic, NULL, *count);
++	if (error) {
++		pci_msi_free_vectors(msi_pic, *count);
++		destruct_msi_pic(msi_pic);
++		return 1;
++	}
++
++	*ihps = vectors;
++	return 0;
++}
++
++static int
++pci_msi_alloc_md(pci_intr_handle_t **ihps, int *count, struct pci_attach_args *pa)
++{
++	return pci_msi_alloc_md_common(ihps, count, pa, false);
++}
++
++static int
++pci_msi_alloc_exact_md(pci_intr_handle_t **ihps, int count, struct pci_attach_args *pa)
++{
++	return pci_msi_alloc_md_common(ihps, &count, pa, true);
++
++}
++
++static void
++pci_msi_release_md(pci_intr_handle_t **pihs, int count)
++{
++	struct pic *pic;
++	pci_intr_handle_t *vectors;
++
++	vectors = *pihs;
++	pic = find_msi_pic(MSI_INT_DEV(vectors[0]));
++	if (pic == NULL)
++		return;
++
++	pci_msi_free_vectors(pic, count);
++	destruct_msi_pic(pic);
++}
++
++static void *
++pci_msi_common_establish_xname(pci_chipset_tag_t pc, pci_intr_handle_t ih,
++    int level, int (*func)(void *), void *arg, struct pic *pic,
++    const char *xname)
++{
++	int pin, irq;
++	bool mpsafe;
++
++	KASSERT(INT_VIA_MSI(ih));
++
++	irq = -1;
++	pin = MSI_INT_VEC(ih);
++	mpsafe = ((ih & MPSAFE_MASK) != 0);
++
++	return intr_establish_xname(irq, pic, pin, IST_EDGE, level, func, arg,
++	    mpsafe, xname);
++}
++
++static void
++pci_msi_common_disestablish(pci_chipset_tag_t pc, void *cookie)
++{
++	intr_disestablish(cookie);
++}
++
++static int
++pci_msix_alloc_md_common(pci_intr_handle_t **ihps, int *count,
++    struct pci_attach_args *pa, bool exact)
++{
++	int i, error;
++	struct pic *msix_pic;
++	pci_intr_handle_t *vectors = NULL;
++
++	if ((pa->pa_flags & PCI_FLAGS_MSI_OKAY) == 0 ||
++	    (pa->pa_flags & PCI_FLAGS_MSIX_OKAY) == 0) {
++		aprint_normal("PCI host bridge does not support MSI-X.\n");
++		return 1;
++	}
++
++	msix_pic = construct_msix_pic(pa);
++	if (msix_pic == NULL)
++		return 1;
++
++	while (*count > 0) {
++		vectors = pci_msi_alloc_vectors(msix_pic, count);
++		if (vectors == NULL) {
++			if (exact) {
++				aprint_normal("cannot allocate MSI-X vectors.\n");
++				return 1;
++			} else {
++				(*count)--;
++				continue;
++			}
++		} else
++			break;
++	}
++	if (vectors == NULL) {
++		aprint_normal("cannot allocate MSI-X vectors.\n");
++		return 1;
++	}
++
++	for (i = 0; i < *count; i++) {
++		MSI_INT_MAKE_MSIX(vectors[i]);
++	}
++
++	error = set_msi_vectors(msix_pic, vectors, *count);
++	if (error) {
++		pci_msi_free_vectors(msix_pic, *count);
++		destruct_msix_pic(msix_pic);
++		return 1;
++	}
++
++	*ihps = vectors;
++	return 0;
++}
++
++static int
++pci_msix_alloc_md(pci_intr_handle_t **ihps, int *count, struct pci_attach_args *pa)
++{
++	return pci_msix_alloc_md_common(ihps, count, pa, false);
++}
++
++static int
++pci_msix_alloc_exact_md(pci_intr_handle_t **ihps, int count, struct pci_attach_args *pa)
++{
++	return pci_msix_alloc_md_common(ihps, &count, pa, true);
++}
++
++static void
++pci_msix_release_md(pci_intr_handle_t **pihs, int count)
++{
++	struct pic *pic;
++	pci_intr_handle_t *vectors;
++
++	vectors = *pihs;
++	pic = find_msi_pic(MSI_INT_DEV(vectors[0]));
++	if (pic == NULL)
++		return;
++
++	pci_msi_free_vectors(pic, count);
++	destruct_msix_pic(pic);
++}
++
++static int
++pci_msix_remap_md(pci_intr_handle_t *pihs, int count)
++{
++	int i, devid;
++	struct pic *msi_pic;
++
++	/* pihs must be the same devid */
++	devid = MSI_INT_DEV(pihs[0]);
++	for (i = 1; i < count; i++) {
++		if (pihs[i] == MSI_INT_MSIX_INVALID)
++			continue;
++
++		if (MSI_INT_DEV(pihs[i]) != devid) {
++			aprint_normal("first devid(%d),but pihs[%d]'s devid(%d).\n",
++			    devid, i, (int)MSI_INT_DEV(pihs[i]));
++			return EINVAL;
++		}
++	}
++
++	msi_pic = find_msi_pic(devid);
++	if (msi_pic == NULL) {
++		aprint_normal("invalid devid: %d\n", devid);
++		return ENOENT;
++	}
++
++	return remap_msix_vectors(msi_pic, pihs, count);
++}
++
++/*****************************************************************************/
++/*
++ * these APIs should be MI code.
++ */
++
++/*
++ * return number of the devices's MSI vectors
++ * return 0 if the device does not support MSI
++ */
++int
++pci_msi_count(struct pci_attach_args *pa)
++{
++	pci_chipset_tag_t pc = pa->pa_pc;
++	pcitag_t tag = pa->pa_tag;
++
++	int offset;
++	pcireg_t reg;
++	int mmc;
++
++	if (pci_get_capability(pc, tag, PCI_CAP_MSI, &offset, NULL) == 0)
++		return 0;
++
++	reg = pci_conf_read(pc, tag, offset + PCI_MSI_CTL);
++	mmc = PCI_MSI_CTL_MMC(reg);
++	switch (mmc) {
++	case 0x6:
++	case 0x7:
++		aprint_normal("the device use reserved MMC values.\n");
++		return 0;
++	default:
++		return 1 << mmc;
++	}
++}
++
++/*
++ * This function is used by device drivers like pci_intr_map().
++ *
++ * "ihps" is the array  of vector numbers which MSI used instead of IRQ number.
++ * "count" must be powr of 2.
++ * "count" can decrease if sturct intrsource cannot be allocated.
++ * if count == 0, return non-zero value.
++ */
++int
++pci_msi_alloc(struct pci_attach_args *pa, pci_intr_handle_t **ihps, int *count)
++{
++	int hw_max;
++
++	if (*count < 1) {
++		aprint_normal("invalid count: %d\n", *count);
++		return 1;
++	}
++	if (((*count - 1) & *count) != 0) {
++		aprint_normal("count %d must be power of 2.\n", *count);
++		return 1;
++	}
++
++	hw_max = pci_msi_count(pa);
++	if (hw_max == 0)
++		return 1;
++
++	if (*count > hw_max) {
++		aprint_normal("cut off MSI count to %d\n", hw_max);
++		*count = hw_max; /* cut off hw_max */
++	}
++
++	return pci_msi_alloc_md(ihps, count, pa);
++}
++
++int
++pci_msi_alloc_exact(struct pci_attach_args *pa, pci_intr_handle_t **ihps, int count)
++{
++	int hw_max;
++
++	if (count < 1) {
++		aprint_normal("invalid count: %d\n", count);
++		return 1;
++	}
++	if (((count - 1) & count) != 0) {
++		aprint_normal("count %d must be power of 2.\n", count);
++		return 1;
++	}
++
++	hw_max = pci_msi_count(pa);
++	if (hw_max == 0)
++		return 1;
++
++	if (count > hw_max) {
++		aprint_normal("over hardware max MSI count %d\n", hw_max);
++		return 1;
++	}
++
++	return pci_msi_alloc_exact_md(ihps, count, pa);
++}
++
++void
++pci_msi_release(pci_intr_handle_t **pihs, int count)
++{
++	if (count < 1) {
++		aprint_normal("invalid count: %d\n", count);
++		return;
++	}
++
++	return pci_msi_release_md(pihs, count);
++}
++
++void *
++pci_msi_establish_xname(pci_chipset_tag_t pc, pci_intr_handle_t ih,
++    int level, int (*func)(void *), void *arg, const char *xname)
++{
++	struct pic *pic;
++
++	pic = find_msi_pic(MSI_INT_DEV(ih));
++	if (pic == NULL) {
++		aprint_normal("pci_intr_handler has no msi_pic\n");
++		return NULL;
++	}
++
++	return pci_msi_common_establish_xname(pc, ih, level, func, arg, pic,
++	    xname);
++}
++
++void *
++pci_msi_establish(pci_chipset_tag_t pc, pci_intr_handle_t ih,
++    int level, int (*func)(void *), void *arg)
++{
++	return pci_msi_establish_xname(pc, ih, level, func, arg, "unknown");
++}
++
++void
++pci_msi_disestablish(pci_chipset_tag_t pc, void *cookie)
++{
++	pci_msi_common_disestablish(pc, cookie);
++}
++
++/*
++ * return number of the devices's MSI-X vectors
++ * return 0 if the device does not support MSI-X
++ */
++int
++pci_msix_count(struct pci_attach_args *pa)
++{
++	pci_chipset_tag_t pc = pa->pa_pc;
++	pcitag_t tag = pa->pa_tag;
++	pcireg_t reg;
++	int offset;
++
++	if (pci_get_capability(pc, tag, PCI_CAP_MSIX, &offset, NULL) == 0)
++		return 0;
++
++	reg = pci_conf_read(pc, tag, offset + PCI_MSIX_CTL);
++
++	return PCI_MSIX_CTL_TBLSIZE(reg);
++}
++
++/*
++ * This function is used by device drivers like pci_intr_map().
++ *
++ * "ihps" is the array  of vector numbers which MSI used instead of IRQ number.
++ * "count" can decrease if sturct intrsource cannot be allocated.
++ * if count == 0, return non-zero value.
++ */
++int
++pci_msix_alloc(struct pci_attach_args *pa, pci_intr_handle_t **ihps, int *count)
++{
++	int hw_max;
++
++	if (*count < 1) {
++		aprint_normal("invalid count: %d\n", *count);
++		return 1;
++	}
++
++	hw_max = pci_msix_count(pa);
++	if (hw_max == 0)
++		return 1;
++
++	if (*count > hw_max) {
++		aprint_normal("cut off MSI-X count to %d\n", hw_max);
++		*count = hw_max; /* cut off hw_max */
++	}
++
++	return pci_msix_alloc_md(ihps, count, pa);
++}
++
++int
++pci_msix_alloc_exact(struct pci_attach_args *pa, pci_intr_handle_t **ihps, int count)
++{
++	int hw_max;
++
++	if (count < 1) {
++		aprint_normal("invalid count: %d\n", count);
++		return 1;
++	}
++
++	hw_max = pci_msix_count(pa);
++	if (hw_max == 0)
++		return 1;
++
++	if (count > hw_max) {
++		aprint_normal("over hardware max MSI-X count %d\n", hw_max);
++		return 1;
++	}
++
++	return pci_msix_alloc_exact_md(ihps, count, pa);
++}
++
++void
++pci_msix_release(pci_intr_handle_t **pihs, int count)
++{
++	if (count < 1) {
++		aprint_normal("invalid count: %d\n", count);
++		return;
++	}
++
++	return pci_msix_release_md(pihs, count);
++}
++
++void *
++pci_msix_establish_xname(pci_chipset_tag_t pc, pci_intr_handle_t ih,
++    int level, int (*func)(void *), void *arg, const char *xname)
++{
++	struct pic *pic;
++
++	pic = find_msi_pic(MSI_INT_DEV(ih));
++	if (pic == NULL) {
++		aprint_normal("pci_intr_handler has no msi_pic\n");
++		return NULL;
++	}
++
++	return pci_msi_common_establish_xname(pc, ih, level, func, arg, pic,
++	    xname);
++}
++
++void *
++pci_msix_establish(pci_chipset_tag_t pc, pci_intr_handle_t ih,
++    int level, int (*func)(void *), void *arg)
++{
++	return pci_msix_establish_xname(pc, ih, level, func, arg, "unknown");
++}
++
++void
++pci_msix_disestablish(pci_chipset_tag_t pc, void *cookie)
++{
++	pci_msi_common_disestablish(pc, cookie);
++}
++
++int
++pci_msix_remap(pci_intr_handle_t *pihs, int count)
++{
++	if (pihs == NULL)
++		return EINVAL;
++
++	if (count < 0 || MAX_MSIX_COUNT < count) {
++		aprint_normal("invalid count: %d", count);
++		return EINVAL;
++	}
++
++	return pci_msix_remap_md(pihs, count);
++}
++
++void
++pci_any_intr_disestablish(pci_chipset_tag_t pc, void *cookie)
++{
++	/* XXXX ov_intr_disestablish() care? */
++	intr_disestablish(cookie);
++}
++
++void
++pci_any_intr_release(pci_intr_handle_t **pihs, int count)
++{
++	if (!INT_VIA_MSI(*pihs[0]))
++		pci_intr_release(pihs[0]);
++	else if (!MSI_INT_IS_MSIX(*pihs[0]))
++		pci_msi_release(pihs, count);
++	else
++		pci_msix_release(pihs, count);
++}
+diff --git a/sys/arch/x86/x86/intr.c b/sys/arch/x86/x86/intr.c
+index e80490a..89e37eb 100644
+--- a/sys/arch/x86/x86/intr.c
++++ b/sys/arch/x86/x86/intr.c
+@@ -179,6 +179,8 @@ __KERNEL_RCSID(0, "$NetBSD: intr.c,v 1.77 2014/05/20 03:24:19 ozaki-r Exp $");
+ #include <dev/pci/ppbreg.h>
+ #endif
+ 
++#include <x86/pci/msipic.h>
++
+ #ifdef DDB
+ #include <ddb/db_output.h>
+ #endif
+@@ -424,6 +426,22 @@ create_intrid(int pin, struct pic *pic, char *buf, size_t len)
+ {
+ 	int ih;
+ 
++	if (pic->pic_type == PIC_MSI || pic->pic_type == PIC_MSIX) {
++		uint64_t pih;
++		int dev, vec;
++
++		dev = msi_get_devid(pic);
++		vec = pin;
++		pih = __SHIFTIN((uint64_t)dev, MSI_INT_DEV_MASK) |
++			__SHIFTIN((uint64_t)vec, MSI_INT_VEC_MASK) | APIC_INT_VIA_MSI;
++		if (pic->pic_type == PIC_MSI)
++			MSI_INT_MAKE_MSI(pih);
++		else if (pic->pic_type == PIC_MSIX)
++			MSI_INT_MAKE_MSIX(pih);
++
++		return pci_msi_string(pih, buf, len);
++	}
++
+ 	ih = ((pic->pic_apicid << APIC_INT_APIC_SHIFT) & APIC_INT_APIC_MASK) |
+ 		((pin << APIC_INT_PIN_SHIFT) & APIC_INT_PIN_MASK);
+ 	if (pic->pic_type == PIC_IOAPIC) {
+@@ -524,13 +542,18 @@ intr_allocate_slot_cpu(struct cpu_info *ci, struct pic *pic, int pin,
+ 		KASSERT(CPU_IS_PRIMARY(ci));
+ 		slot = pin;
+ 	} else {
++		int start = 0;
+ 		slot = -1;
+ 
++		/* avoid reserved slots for legacy interrupts. */
++		if (is_msi_pic(pic))
++			start = NUM_LEGACY_IRQS;
++
+ 		/*
+ 		 * intr_allocate_slot has checked for an existing mapping.
+ 		 * Now look for a free slot.
+ 		 */
+-		for (i = 0; i < MAX_INTR_SOURCES ; i++) {
++		for (i = start; i < MAX_INTR_SOURCES ; i++) {
+ 			if (ci->ci_isources[i] == NULL) {
+ 				slot = i;
+ 				break;
+@@ -842,8 +865,15 @@ intr_establish_xname(int legacy_irq, struct pic *pic, int pin, int type, int lev
+ 	/* allocate intrsource pool, if not yet. */
+ 	chained = intr_get_io_intrsource(intrstr);
+ 	if (chained == NULL) {
++		if (is_msi_pic(pic)) {
++			mutex_exit(&cpu_lock);
++			printf("%s: %s has no intrsource\n", __func__, intrstr);
++			return NULL;
++		}
++
+ 		chained = intr_allocate_io_intrsource(intrstr);
+ 		if (chained == NULL) {
++			mutex_exit(&cpu_lock);
+ 			printf("%s: can't allocate io_intersource\n", __func__);
+ 			return NULL;
+ 		}
+@@ -1086,7 +1116,7 @@ intr_disestablish(struct intrhand *ih)
+ 		where = xc_unicast(0, intr_disestablish_xcall, ih, NULL, ci);
+ 		xc_wait(where);
+ 	}	
+-	if (intr_num_handlers(isp) < 1) {
++	if (!is_msi_pic(isp->is_pic) && intr_num_handlers(isp) < 1) {
+ 		intr_free_io_intrsource_direct(isp);
+ 	}
+ 	mutex_exit(&cpu_lock);
+@@ -1104,7 +1134,6 @@ intr_string(int ih, char *buf, size_t len)
+ 	if (ih == 0)
+ 		panic("%s: bogus handle 0x%x", __func__, ih);
+ 
+-
+ #if NIOAPIC > 0
+ 	if (ih & APIC_INT_VIA_APIC) {
+ 		pic = ioapic_find(APIC_IRQ_APIC(ih));
+diff --git a/sys/dev/pci/pci.c b/sys/dev/pci/pci.c
+index b8e2ece..fb2542a 100644
+--- a/sys/dev/pci/pci.c
++++ b/sys/dev/pci/pci.c
+@@ -274,8 +274,8 @@ pci_probe_device(struct pci_softc *sc, pcitag_t tag,
+ {
+ 	pci_chipset_tag_t pc = sc->sc_pc;
+ 	struct pci_attach_args pa;
+-	pcireg_t id, /* csr, */ pciclass, intr, bhlcr, bar, endbar;
+-	int ret, pin, bus, device, function, i, width;
++	pcireg_t id, /* csr, */ pciclass, intr, bhlcr, bar, endbar, cap;
++	int ret, pin, bus, device, function, i, width, off;
+ 	int locs[PCICF_NLOCS];
+ 
+ 	pci_decompose_tag(pc, tag, &bus, &device, &function);
+@@ -406,6 +406,32 @@ pci_probe_device(struct pci_softc *sc, pcitag_t tag,
+ 	}
+ 	pa.pa_intrline = PCI_INTERRUPT_LINE(intr);
+ 
++	if (pci_get_ht_capability(pc, tag, PCI_HT_CAP_MSIMAP, &off, &cap)) {
++		/*
++		 * XXX Should we enable MSI mapping ourselves on
++		 * systems that have it disabled?
++		 */
++		if (cap & PCI_HT_MSI_ENABLED) {
++			uint64_t addr;
++			if ((cap & PCI_HT_MSI_FIXED) == 0) {
++				addr = pci_conf_read(pc, tag,
++				    off + PCI_HT_MSI_ADDR_LO);
++				addr |= (uint64_t)pci_conf_read(pc, tag,
++				    off + PCI_HT_MSI_ADDR_HI) << 32;
++			} else
++				addr = PCI_HT_MSI_FIXED_ADDR;
++
++			/*
++			 * XXX This will fail to enable MSI on systems
++			 * that don't use the canonical address.
++			 */
++			if (addr == PCI_HT_MSI_FIXED_ADDR) {
++				pa.pa_flags |= PCI_FLAGS_MSI_OKAY;
++				pa.pa_flags |= PCI_FLAGS_MSIX_OKAY;
++			}
++		}
++	}
++
+ 	if (match != NULL) {
+ 		ret = (*match)(&pa);
+ 		if (ret != 0 && pap != NULL)
+@@ -508,6 +534,35 @@ pci_get_capability(pci_chipset_tag_t pc, pcitag_t tag, int capid,
+ }
+ 
+ int
++pci_get_ht_capability(pci_chipset_tag_t pc, pcitag_t tag, int capid,
++    int *offset, pcireg_t *value)
++{
++	pcireg_t reg;
++	unsigned int ofs;
++
++	if (pci_get_capability(pc, tag, PCI_CAP_LDT, &ofs, NULL) == 0)
++		return 0;
++
++	while (ofs != 0) {
++#ifdef DIAGNOSTIC
++		if ((ofs & 3) || (ofs < 0x40))
++			panic("pci_get_ht_capability");
++#endif
++		reg = pci_conf_read(pc, tag, ofs);
++		if (PCI_HT_CAP(reg) == capid) {
++			if (offset)
++				*offset = ofs;
++			if (value)
++				*value = reg;
++			return 1;
++		}
++		ofs = PCI_CAPLIST_NEXT(reg);
++	}
++
++	return 0;
++}
++
++int
+ pci_find_device(struct pci_attach_args *pa,
+ 		int (*match)(const struct pci_attach_args *))
+ {
+diff --git a/sys/dev/pci/pcidevs.h b/sys/dev/pci/pcidevs.h
+index df399f3..5a8e58e 100644
+--- a/sys/dev/pci/pcidevs.h
++++ b/sys/dev/pci/pcidevs.h
+@@ -4441,8 +4441,17 @@
+ #define	PCI_PRODUCT_NVIDIA_QUADRO4_380XGL	0x018b		/* Quadro4 380 XGL */
+ #define	PCI_PRODUCT_NVIDIA_QUADROFX4600	0x019e		/* Quadro FX 4600 */
+ #define	PCI_PRODUCT_NVIDIA_GEFORCE2_IGP	0x01a0		/* GeForce2 Integrated GPU */
++#define	PCI_PRODUCT_NVIDIA_NFORCE_PCHB	0x01a4		/* nForce PCI Host */
++#define	PCI_PRODUCT_NVIDIA_NFORCE_DDR2	0x01aa		/* nForce 220 DDR */
++#define	PCI_PRODUCT_NVIDIA_NFORCE_DDR	0x01ab		/* nForce 420 DDR */
++#define	PCI_PRODUCT_NVIDIA_NFORCE_MEM	0x01ac		/* nForce 220/420 */
++#define	PCI_PRODUCT_NVIDIA_NFORCE_MEM1	0x01ad		/* nForce 220/420 */
++#define	PCI_PRODUCT_NVIDIA_NFORCE_APU	0x01b0		/* nForce APU */
+ #define	PCI_PRODUCT_NVIDIA_NFORCE_MCP_AC	0x01b1		/* nForce MCP AC-97 */
++#define	PCI_PRODUCT_NVIDIA_NFORCE_ISA	0x01b2		/* nForce ISA */
+ #define	PCI_PRODUCT_NVIDIA_XBOX_SMBUS	0x01b4		/* Xbox nForce SMBus Controller */
++#define	PCI_PRODUCT_NVIDIA_NFORCE_AGP	0x01b7		/* nForce AGP */
++#define	PCI_PRODUCT_NVIDIA_NFORCE_PPB	0x01b8		/* nForce */
+ #define	PCI_PRODUCT_NVIDIA_NFORCE_ATA100	0x01bc		/* nForce ATA100 IDE */
+ #define	PCI_PRODUCT_NVIDIA_NFORCE_USB	0x01c2		/* nForce USB */
+ #define	PCI_PRODUCT_NVIDIA_NFORCE_LAN	0x01c3		/* nForce Ethernet */
+diff --git a/sys/dev/pci/pcireg.h b/sys/dev/pci/pcireg.h
+index d54032d..4099de7 100644
+--- a/sys/dev/pci/pcireg.h
++++ b/sys/dev/pci/pcireg.h
+@@ -639,7 +639,9 @@ typedef u_int8_t pci_revision_t;
+ #define	PCI_MSI_CTL_PERVEC_MASK	__SHIFTIN(__BIT(8), PCI_MSI_CTL_MASK)
+ #define	PCI_MSI_CTL_64BIT_ADDR	__SHIFTIN(__BIT(7), PCI_MSI_CTL_MASK)
+ #define	PCI_MSI_CTL_MME_MASK	__SHIFTIN(__BITS(6, 4), PCI_MSI_CTL_MASK)
++#define	PCI_MSI_CTL_MME(reg)	__SHIFTOUT(reg, PCI_MSI_CTL_MME_MASK)
+ #define	PCI_MSI_CTL_MMC_MASK	__SHIFTIN(__BITS(3, 1), PCI_MSI_CTL_MASK)
++#define	PCI_MSI_CTL_MMC(reg)	__SHIFTOUT(reg, PCI_MSI_CTL_MMC_MASK)
+ #define	PCI_MSI_CTL_MSI_ENABLE	__SHIFTIN(__BIT(0), PCI_MSI_CTL_MASK)
+ 
+ /*
+@@ -1053,14 +1055,18 @@ typedef u_int8_t pci_revision_t;
+ #define	PCI_MSIX_PBAOFFSET_MASK	0xfffffff8
+ #define	PCI_MSIX_PBABIR_MASK	0x00000007
+ 
++#define PCI_MSIX_TABLE_ENTRY_SIZE	16
++#define PCI_MSIX_TABLE_ENTRY_ADDR_LO	0x0
++#define PCI_MSIX_TABLE_ENTRY_ADDR_HI	0x4
++#define PCI_MSIX_TABLE_ENTRY_DATA	0x8
++#define PCI_MSIX_TABLE_ENTRY_VECTCTL	0xc
+ struct pci_msix_table_entry {
+ 	uint32_t pci_msix_addr_lo;
+ 	uint32_t pci_msix_addr_hi;
+ 	uint32_t pci_msix_value;
+-	uint32_t pci_msix_vendor_control;
++	uint32_t pci_msix_vector_control;
+ };
+-#define	PCI_MSIX_VENDCTL_MASK	0x00000001
+-
++#define	PCI_MSIX_VECTCTL_HWMASK_MASK	0x00000001
+ 
+ /*
+  * Capability ID: 0x12
+diff --git a/sys/dev/pci/pcivar.h b/sys/dev/pci/pcivar.h
+index 7e53e4e..624925a 100644
+--- a/sys/dev/pci/pcivar.h
++++ b/sys/dev/pci/pcivar.h
+@@ -275,6 +275,7 @@ int pci_find_rom(const struct pci_attach_args *, bus_space_tag_t,
+ 	    int, bus_space_handle_t *, bus_size_t *);
+ 
+ int pci_get_capability(pci_chipset_tag_t, pcitag_t, int, int *, pcireg_t *);
++int pci_get_ht_capability(pci_chipset_tag_t, pcitag_t, int, int *, pcireg_t *);
+ 
+ /*
+  * Helper functions for autoconfiguration.
